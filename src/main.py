@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import os
 from tavily import TavilyClient
 import json
+from google import genai
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -17,6 +18,9 @@ tavily_client = TavilyClient(
     api_key=os.getenv("TAVILY_API_KEY")
 )
 
+gemini_client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY")
+)
 # Loading chromadb
 chroma_client = chromadb.PersistentClient(
     path=(BASE_DIR / "rag_chatbot_project/chroma_db")
@@ -30,20 +34,43 @@ collection = chroma_client.get_collection(
 
 # print("Collection Count : ", collection.count())
 
-question = input("Please ask your question  or enter /bye: ")
 state = {
-    "question": question,
+    "question": "",
+    "plan": [],
     "tool": "",
     "context": [],
+    "messages": [],
     "attempts": 0,
     "answer": ""
 }
 
 
+def ask_question(state):
+    state["question"] = input(
+        "Please ask your question  (or type exit) : ")
+
+    return state
+
+
+def question_router(state):
+    if state["question"].lower() == "exit":
+        return "exit"
+    else:
+        return "planner"
+
+
 def planner(state):
+
+    memory = get_memory(state)
+
+    state["plan"] = create_plan(state)
+
     prompt = f"""
 
 You are a routing agent.
+
+Conversation History:
+{memory}
 
 Question:
 {state["question"]}
@@ -92,23 +119,15 @@ Example:
 -do not output multiple options.
 
     """
-    decision = call_llm(prompt)
+    decision = call_local_llm(prompt)
     print("Decision: ", decision)
 
-    parsed = json.loads(decision)
+    try:
+        parsed = json.loads(decision)
+        state["tool"] = parsed["tool"]
 
-    # state["tool"] = parsed["tool"]
-
-    if "calculator" in decision.lower():
-        state["tool"] = "calculator"
-
-    elif "rag" in decision.lower():
-        state["tool"] = "rag"
-
-    elif "web_search" in decision.lower():
-        state["tool"] = "web_search"
-
-    else:
+    except Exception:
+        print("Invalid JSON from planner")
         state["tool"] = "direct_llm"
 
     return state
@@ -126,7 +145,40 @@ def planner_router(state):
         return "call_web_search"
 
     else:
-        return "web_search"
+        return "call_direct_llm"
+
+
+def create_plan(state):
+    prompt = f"""
+You are a planning agent.
+Question:
+{state["question"]}
+
+Break the task into steps 
+
+Return JSON:
+
+{{
+        "plan":[
+           "step1",
+           "step2"
+]
+
+}}
+
+Return raw JSON only.
+
+Do NOT wrap in markdown.
+Do NOT use ```json.
+Do NOT explain.
+Return only valid JSON.
+
+"""
+    plan = call_cloud_llm(prompt)
+    parsed = json.loads(plan)
+    state["plan"] = parsed["plan"]
+
+    return state
 
 
 def retrieve(state):
@@ -169,7 +221,14 @@ def call_calculator(state):
 
 
 def call_direct_llm(state):
+
+    memory = get_memory(state)
+
     prompt = f"""
+
+Conversation History:
+{memory}
+
 Question:
 {state["question"]} 
 
@@ -179,7 +238,7 @@ You are a genious mentor:
 
 """
 
-    state["answer"] = call_llm(prompt)
+    state["answer"] = call_local_llm(prompt)
 
     return state
 
@@ -214,7 +273,7 @@ Take the search results and answer in 5 bullet points.
 
 """
 
-    state["answer"] = call_llm(prompt)
+    state["answer"] = call_local_llm(prompt)
 
     return state
 
@@ -241,7 +300,7 @@ Reply ONLY with a short retrieval query
 Do not explain your reasoning.
 """
 
-    decision = call_llm(prompt).strip().upper()
+    decision = call_local_llm(prompt).strip().upper()
 
     print("Decision: ", decision)
 
@@ -257,14 +316,14 @@ Do not explain your reasoning.
 
 def context_router(state):
     if state["enough_context"]:
-        return "answer"
+        return "final_retrieval"
     if state["attempts"] >= 3:
-        return "answer"
+        return "final_retrieval"
 
     return "retrieve"
 
 
-def answer(state):
+def final_retrieval(state):
     prompt = f"""
 Question:
 {state["question"]}
@@ -276,12 +335,38 @@ Context:
 -Answer in 5 bullet points
 """
 
-    state["answer"] = call_llm(prompt)
+    state["answer"] = call_local_llm(prompt)
 
     return state
 
 
-def call_llm(prompt):
+def memory_update(state):
+    state["messages"].append(
+        {
+            "role": "user",
+            "content": state["question"]
+        }
+    )
+
+    state["messages"].append(
+        {
+            "role": "assistant",
+            "content": state["answer"]
+        }
+    )
+
+    print("Answer: ", state["answer"])
+
+    return state
+
+
+def exit(state):
+
+    # print("Messages: ", state["messages"])
+    return state
+
+
+def call_local_llm(prompt):
     response = chat(
         model="gemma4:e2b",
         messages=[
@@ -296,12 +381,34 @@ def call_llm(prompt):
     return answer
 
 
+def call_cloud_llm(prompt):
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+    answer = response.text
+    print("Answer: ", answer)
+
+    return answer
+
+
+def get_memory(state):
+    return state["messages"][-6:]
+
+
 graph_builder = StateGraph(dict)
+
+
+graph_builder.add_node(
+    "ask_question",
+    ask_question
+)
 
 graph_builder.add_node(
     "planner",
     planner
 )
+
 graph_builder.add_node(
     "retrieve",
     retrieve
@@ -323,8 +430,8 @@ graph_builder.add_node(
 )
 
 graph_builder.add_node(
-    "answer",
-    answer
+    "final_retrieval",
+    final_retrieval
 )
 
 graph_builder.add_node(
@@ -332,10 +439,27 @@ graph_builder.add_node(
     evaluate_context
 )
 
+graph_builder.add_node(
+    "memory_update",
+    memory_update
+)
+
+graph_builder.add_node(
+    "exit",
+    exit
+)
+
 
 graph_builder.set_entry_point(
-    "planner"
+    "ask_question"
 )
+
+graph_builder.add_conditional_edges(
+    "ask_question",
+    question_router
+)
+
+
 graph_builder.add_conditional_edges(
     "planner",
     planner_router
@@ -351,23 +475,35 @@ graph_builder.add_conditional_edges(
     context_router
 )
 
-graph_builder.set_finish_point(
-    "answer"
+graph_builder.add_edge(
+    "final_retrieval",
+    "memory_update"
+)
+
+graph_builder.add_edge(
+    "call_calculator",
+    "memory_update"
+)
+
+graph_builder.add_edge(
+    "call_direct_llm",
+    "memory_update"
+)
+
+graph_builder.add_edge(
+    "call_web_search",
+    "memory_update"
+)
+
+graph_builder.add_edge(
+    "memory_update",
+    "ask_question"
 )
 
 graph_builder.set_finish_point(
-    "call_calculator"
+    "exit"
 )
 
-graph_builder.set_finish_point(
-    "call_direct_llm"
-)
-
-graph_builder.set_finish_point(
-    "call_web_search"
-)
 
 graph = graph_builder.compile()
-
-result = graph.invoke(state)
-print(result["answer"])
+graph.invoke(state)
